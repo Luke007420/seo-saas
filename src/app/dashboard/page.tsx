@@ -166,6 +166,21 @@ export default function DashboardPage() {
       setGenerating(false);
     }
   }
+   async function openBillingPortal() {
+   if (!userId) return;
+   const res = await fetch("/api/stripe/portal", {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+     body: JSON.stringify({ userId }),
+   });
+   const json = (await res.json()) as { url?: string; error?: string };
+   if (!res.ok || !json.url) {
+     alert(json?.error || "Failed to open billing portal");
+     return;
+   }
+   window.location.href = json.url;
+ }
+
 
   if (loading) return <div className="p-8">Loading…</div>;
 
@@ -181,6 +196,15 @@ export default function DashboardPage() {
           <Link href="/pricing" className="text-sm underline">
             Pricing
           </Link>
+          {isPro && (
+  <button
+    className="rounded-md border px-3 py-1 text-sm hover:bg-gray-50"
+    onClick={openBillingPortal}
+  >
+    Manage billing
+  </button>
+)}
+
           <button
             className="rounded-md border px-3 py-1 text-sm hover:bg-gray-50"
             onClick={async () => {

@@ -18,6 +18,8 @@ const DAILY_FREE_LIMIT = 5;
 
 export default function DashboardPage() {
   const router = useRouter();
+
+  // auth/user
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
@@ -26,7 +28,7 @@ export default function DashboardPage() {
   const [isPro, setIsPro] = useState(false);
   const [todayCount, setTodayCount] = useState(0);
 
-  // form state
+  // form
   const [title, setTitle] = useState("");
   const [keywordsInput, setKeywordsInput] = useState("");
   const keywords = useMemo(
@@ -38,12 +40,12 @@ export default function DashboardPage() {
     [keywordsInput]
   );
 
-  // generation state
+  // generation/history
   const [generating, setGenerating] = useState(false);
   const [history, setHistory] = useState<Generation[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // helpers
+  // day boundaries (local time)
   const startOfTodayISO = useMemo(() => {
     const d = new Date();
     d.setHours(0, 0, 0, 0);
@@ -64,28 +66,30 @@ export default function DashboardPage() {
     if (!error && data) setHistory(data as Generation[]);
   }, []);
 
-  const loadPlanAndUsage = useCallback(async (uid: string) => {
-    // Get plan (profiles.is_pro) — missing profile counts as false (Free)
-    const { data: profile, error: profErr } = await supabase
-      .from("profiles")
-      .select("is_pro")
-      .eq("user_id", uid)
-      .maybeSingle();
-    if (!profErr && profile?.is_pro) setIsPro(true);
-    else setIsPro(false);
+  const loadPlanAndUsage = useCallback(
+    async (uid: string) => {
+      // plan
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("is_pro")
+        .eq("user_id", uid)
+        .maybeSingle();
+      setIsPro(!!profile?.is_pro);
 
-    // Get today's usage count
-    const { count } = await supabase
-      .from("generations")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", uid)
-      .gte("created_at", startOfTodayISO)
-      .lte("created_at", endOfTodayISO);
+      // usage today
+      const { count } = await supabase
+        .from("generations")
+        .select("*", { count: "exact", head: true })
+        .eq("user_id", uid)
+        .gte("created_at", startOfTodayISO)
+        .lte("created_at", endOfTodayISO);
 
-    setTodayCount(count ?? 0);
-  }, [endOfTodayISO, startOfTodayISO]);
+      setTodayCount(count ?? 0);
+    },
+    [endOfTodayISO, startOfTodayISO]
+  );
 
-  // auth + initial data
+  // auth + initial load
   useEffect(() => {
     supabase.auth.getSession().then(async ({ data }) => {
       const session = data.session;
@@ -106,6 +110,7 @@ export default function DashboardPage() {
     return () => listener.subscription.unsubscribe();
   }, [loadHistory, loadPlanAndUsage, router]);
 
+  // ⬇️ NEW: no client DB insert — call /api/generate (server enforces limit & saves row)
   async function onGenerate(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
@@ -118,8 +123,7 @@ export default function DashboardPage() {
       setError("Not signed in.");
       return;
     }
-
-    // Soft paywall: block if Free and at limit
+    // client-side UX guard (server also enforces)
     if (!isPro && todayCount >= DAILY_FREE_LIMIT) {
       setError(
         `Daily limit reached (${DAILY_FREE_LIMIT}/day on Free). Visit the Pricing page to upgrade.`
@@ -129,64 +133,43 @@ export default function DashboardPage() {
 
     setGenerating(true);
     try {
-      // 1) Ask our API to generate the Markdown
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, keywords }),
       });
-      const json = await res.json();
+      const json = (await res.json()) as { output_markdown?: string; error?: string };
       if (!res.ok) throw new Error(json?.error || "Failed to generate");
 
-      const output_markdown: string = json.output_markdown || "";
-
-      // 2) Save to Supabase as the logged-in user (RLS will allow this)
-      const { error: dbErr } = await supabase.from("generations").insert([
-        {
-          user_id: userId,
-          product_title: title,
-          keywords,
-          output_markdown,
-        },
-      ]);
-      if (dbErr) throw dbErr;
-
-      // 3) Refresh history & usage
+      // server already inserted the row; refresh UI
       await Promise.all([loadHistory(), loadPlanAndUsage(userId)]);
-
     } catch (err: unknown) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : typeof err === "string"
-          ? err
-          : "Something went wrong";
+      const message = err instanceof Error ? err.message : "Something went wrong";
       setError(message);
     } finally {
       setGenerating(false);
     }
   }
-   async function openBillingPortal() {
-   if (!userId) return;
-   const res = await fetch("/api/stripe/portal", {
-     method: "POST",
-     headers: { "Content-Type": "application/json" },
-     body: JSON.stringify({ userId }),
-   });
-   const json = (await res.json()) as { url?: string; error?: string };
-   if (!res.ok || !json.url) {
-     alert(json?.error || "Failed to open billing portal");
-     return;
-   }
-   window.location.href = json.url;
- }
 
+  // Manage billing (Stripe Customer Portal)
+  async function openBillingPortal() {
+    if (!userId) return;
+    const res = await fetch("/api/stripe/portal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId }),
+    });
+    const json = (await res.json()) as { url?: string; error?: string };
+    if (!res.ok || !json.url) {
+      alert(json?.error || "Failed to open billing portal");
+      return;
+    }
+    window.location.href = json.url;
+  }
 
   if (loading) return <div className="p-8">Loading…</div>;
 
-  const usageText = isPro
-    ? "Unlimited on Pro"
-    : `${todayCount}/${DAILY_FREE_LIMIT} used today`;
+  const usageText = isPro ? "Unlimited on Pro" : `${todayCount}/${DAILY_FREE_LIMIT} used today`;
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
@@ -197,14 +180,13 @@ export default function DashboardPage() {
             Pricing
           </Link>
           {isPro && (
-  <button
-    className="rounded-md border px-3 py-1 text-sm hover:bg-gray-50"
-    onClick={openBillingPortal}
-  >
-    Manage billing
-  </button>
-)}
-
+            <button
+              className="rounded-md border px-3 py-1 text-sm hover:bg-gray-50"
+              onClick={openBillingPortal}
+            >
+              Manage billing
+            </button>
+          )}
           <button
             className="rounded-md border px-3 py-1 text-sm hover:bg-gray-50"
             onClick={async () => {
@@ -217,17 +199,13 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      
       <div className="mt-1 text-sm text-gray-500">Signed in as {email}</div>
-  
-
-
 
       <div className="mt-1 text-sm text-gray-500">
         Plan: {isPro ? "Pro" : "Free"} • Usage: {usageText}
       </div>
       <p className="text-xs text-gray-500">
-        (To test Pro, set <code>is_pro = true</code> for your user in Supabase → profiles.)
+        (To test Pro manually, set <code>is_pro = true</code> for your user in Supabase → profiles.)
       </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-8">

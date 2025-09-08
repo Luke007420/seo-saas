@@ -1,33 +1,66 @@
 import OpenAI from "openai";
+import { cookies } from "next/headers";
+import { createRouteHandlerClient } from "@supabase/auth-helpers-nextjs";
+
+const DAILY_FREE_LIMIT = 5;
+
+type GenerateBody = {
+  title?: string;
+  keywords?: string[] | string;
+};
+
+export const runtime = "nodejs";
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
+    const body = (await req.json()) as GenerateBody;
     const title = (body?.title ?? "").toString().trim();
     const keywordsInput = body?.keywords ?? [];
     const keywords = Array.isArray(keywordsInput)
       ? keywordsInput
-      : String(keywordsInput)
-          .split(",")
-          .map((k) => k.trim())
-          .filter(Boolean);
+      : String(keywordsInput).split(",").map((k) => k.trim()).filter(Boolean);
 
     if (!title || keywords.length === 0) {
-      return new Response(JSON.stringify({ error: "Missing title or keywords" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+      return json({ error: "Missing title or keywords" }, 400);
     }
 
+    // auth (read Supabase session from cookies)
+    const supabase = createRouteHandlerClient({ cookies });
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData.session;
+    if (!session) return json({ error: "Not signed in" }, 401);
+    const userId = session.user.id;
+
+    // plan check
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("is_pro")
+      .eq("user_id", userId)
+      .maybeSingle();
+    const isPro = !!profile?.is_pro;
+
+    // usage check (today)
+    if (!isPro) {
+      const start = new Date(); start.setHours(0, 0, 0, 0);
+      const end = new Date();   end.setHours(23, 59, 59, 999);
+
+      const { count } = await supabase
+        .from("generations")
+        .select("*", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .gte("created_at", start.toISOString())
+        .lte("created_at", end.toISOString());
+
+      if ((count ?? 0) >= DAILY_FREE_LIMIT) {
+        return json({ error: `Daily limit reached (${DAILY_FREE_LIMIT}/day on Free).` }, 403);
+      }
+    }
+
+    // OpenAI call
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return new Response(JSON.stringify({ error: "Missing OPENAI_API_KEY" }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
+    if (!apiKey) return json({ error: "Missing OPENAI_API_KEY" }, 500);
     const openai = new OpenAI({ apiKey });
+
     const prompt = [
       `You are an e-commerce SEO copywriter.`,
       `Create product copy in Markdown using this structure:`,
@@ -53,22 +86,29 @@ export async function POST(req: Request) {
       temperature: 0.7,
     });
 
-    const output = completion.choices?.[0]?.message?.content?.trim() || "";
-    return new Response(JSON.stringify({ output_markdown: output }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  } catch (err: unknown) {
-  let message = "Unknown error";
-  if (err instanceof Error) {
-    message = err.message;
-  } else if (typeof err === "object" && err !== null && "message" in err) {
-    message = String((err as { message?: unknown }).message ?? "Unknown error");
-  }
-  return new Response(JSON.stringify({ error: message }), {
-    status: 500,
-    headers: { "Content-Type": "application/json" },
-    });
-  }
+    const output_markdown = completion.choices?.[0]?.message?.content?.trim() || "";
 
+    // save to DB as the user
+    const { error: dbErr } = await supabase.from("generations").insert([
+      {
+        user_id: userId,
+        product_title: title,
+        keywords,
+        output_markdown,
+      },
+    ]);
+    if (dbErr) return json({ error: dbErr.message }, 500);
+
+    return json({ output_markdown }, 200);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return json({ error: message }, 500);
+  }
+}
+
+function json(payload: unknown, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
